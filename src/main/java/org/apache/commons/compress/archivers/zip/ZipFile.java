@@ -17,13 +17,7 @@
  */
 package org.apache.commons.compress.archivers.zip;
 
-import java.io.BufferedInputStream;
-import java.io.Closeable;
-import java.io.EOFException;
-import java.io.File;
-import java.io.IOException;
-import java.io.InputStream;
-import java.io.RandomAccessFile;
+import java.io.*;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
@@ -517,10 +511,26 @@ public class ZipFile implements Closeable {
         HashMap<ZipArchiveEntry, NameAndComment> noUTF8Flag =
             new HashMap<ZipArchiveEntry, NameAndComment>();
 
-        positionAtCentralDirectory();
+        long size = positionAtCentralDirectory();
 
-        archive.readFully(WORD_BUF);
-        long sig = ZipLong.getValue(WORD_BUF);
+        final DataInput input;
+        if (!slow && (size >= 0 && size < Integer.MAX_VALUE)) {
+            // Read the whole directory in one go to reduce number of read calls (important when opening zips over SMB)
+            final byte[] directoryBytes = new byte[(int)size];
+            archive.readFully(directoryBytes);
+            input = new DataInputStream(new ByteArrayInputStream(directoryBytes));
+        } else {
+            // Should never happen, but easy to do the right thing here
+            input = archive;
+        }
+
+        long sig;
+        try {
+            input.readFully(WORD_BUF);
+            sig = ZipLong.getValue(WORD_BUF);
+        } catch (EOFException _) {
+            sig = ~CFH_SIG;
+        }
 
         if (sig != CFH_SIG && startsWithLocalFileHeader()) {
             throw new IOException("central directory is empty, can't expand"
@@ -528,9 +538,13 @@ public class ZipFile implements Closeable {
         }
 
         while (sig == CFH_SIG) {
-            readCentralDirectoryEntry(noUTF8Flag);
-            archive.readFully(WORD_BUF);
-            sig = ZipLong.getValue(WORD_BUF);
+            readCentralDirectoryEntry(input, noUTF8Flag);
+            try {
+                input.readFully(WORD_BUF);
+                sig = ZipLong.getValue(WORD_BUF);
+            } catch (EOFException _) {
+                sig = ~CFH_SIG;
+            }
         }
         return noUTF8Flag;
     }
@@ -545,9 +559,9 @@ public class ZipFile implements Closeable {
      * added to this map.
      */
     private void
-        readCentralDirectoryEntry(Map<ZipArchiveEntry, NameAndComment> noUTF8Flag)
+        readCentralDirectoryEntry(DataInput input, Map<ZipArchiveEntry, NameAndComment> noUTF8Flag)
         throws IOException {
-        archive.readFully(CFH_BUF);
+        input.readFully(CFH_BUF);
         int off = 0;
         OffsetEntry offset = new OffsetEntry();
         Entry ze = new Entry(offset);
@@ -601,7 +615,7 @@ public class ZipFile implements Closeable {
         off += WORD;
 
         byte[] fileName = new byte[fileNameLen];
-        archive.readFully(fileName);
+        input.readFully(fileName);
         ze.setName(entryEncoding.decode(fileName), fileName);
 
         // LFH offset,
@@ -610,13 +624,13 @@ public class ZipFile implements Closeable {
         entries.add(ze);
 
         byte[] cdExtraData = new byte[extraLen];
-        archive.readFully(cdExtraData);
+        input.readFully(cdExtraData);
         ze.setCentralDirectoryExtra(cdExtraData);
 
         setSizesAndOffsetFromZip64Extra(ze, offset, diskStart);
 
         byte[] comment = new byte[commentLen];
-        archive.readFully(comment);
+        input.readFully(comment);
         ze.setComment(entryEncoding.decode(comment));
 
         if (!hasUTF8Flag && useUnicodeExtraFields) {
@@ -636,9 +650,9 @@ public class ZipFile implements Closeable {
      * even if they are never used - and here a field with only one
      * size would be invalid.</p>
      */
-    private void setSizesAndOffsetFromZip64Extra(ZipArchiveEntry ze,
-                                                 OffsetEntry offset,
-                                                 int diskStart)
+    private static void setSizesAndOffsetFromZip64Extra(ZipArchiveEntry ze,
+                                                        OffsetEntry offset,
+                                                        int diskStart)
         throws IOException {
         Zip64ExtendedInformationExtraField z64 =
             (Zip64ExtendedInformationExtraField)
@@ -700,12 +714,12 @@ public class ZipFile implements Closeable {
         /* maximum length of zipfile comment */ + ZIP64_MAGIC_SHORT;
 
     /**
-     * Offset of the field that holds the location of the first
-     * central directory entry inside the "End of central directory
+     * Offset of the field that holds the size of the
+     * central directory inside the "End of central directory
      * record" relative to the start of the "End of central directory
      * record".
      */
-    private static final int CFD_LOCATOR_OFFSET =
+    private static final int CFD_SIZE_OFFSET =
         /* end of central dir signature    */ WORD
         /* number of this disk             */ + SHORT
         /* number of the disk with the     */
@@ -713,8 +727,7 @@ public class ZipFile implements Closeable {
         /* total number of entries in      */
         /* the central dir on this disk    */ + SHORT
         /* total number of entries in      */
-        /* the central dir                 */ + SHORT
-        /* size of the central directory   */ + WORD;
+        /* the central dir                 */ + SHORT;
 
     /**
      * Length of the "Zip64 end of central directory locator" - which
@@ -748,7 +761,7 @@ public class ZipFile implements Closeable {
      * directory record" relative to the start of the "Zip64 end of
      * central directory record".
      */
-    private static final int ZIP64_EOCD_CFD_LOCATOR_OFFSET =
+    private static final int ZIP64_EOCD_CFD_SIZE_OFFSET =
         /* zip64 end of central dir        */
         /* signature                       */ WORD
         /* size of zip64 end of central    */
@@ -761,8 +774,7 @@ public class ZipFile implements Closeable {
         /* total number of entries in the  */
         /* central directory on this disk  */ + DWORD
         /* total number of entries in the  */
-        /* central directory               */ + DWORD
-        /* size of the central directory   */ + DWORD;
+        /* central directory               */ + DWORD;
 
     /**
      * Searches for either the &quot;Zip64 end of central directory
@@ -770,7 +782,7 @@ public class ZipFile implements Closeable {
      * it and positions the stream at the first central directory
      * record.
      */
-    private void positionAtCentralDirectory()
+    private long positionAtCentralDirectory()
         throws IOException {
         positionAtEndOfCentralDirectoryRecord();
         boolean found = false;
@@ -787,9 +799,9 @@ public class ZipFile implements Closeable {
             if (searchedForZip64EOCD) {
                 skipBytes(ZIP64_EOCDL_LENGTH - WORD);
             }
-            positionAtCentralDirectory32();
+            return positionAtCentralDirectory32();
         } else {
-            positionAtCentralDirectory64();
+            return positionAtCentralDirectory64();
         }
     }
 
@@ -801,8 +813,10 @@ public class ZipFile implements Closeable {
      *
      * Expects stream to be positioned right behind the &quot;Zip64
      * end of central directory locator&quot;'s signature.
+     *
+     * @return Size of the central directory in bytes
      */
-    private void positionAtCentralDirectory64()
+    private long positionAtCentralDirectory64()
         throws IOException {
         skipBytes(ZIP64_EOCDL_LOCATOR_OFFSET
                   - WORD /* signature has already been read */);
@@ -813,10 +827,13 @@ public class ZipFile implements Closeable {
             throw new ZipException("archive's ZIP64 end of central "
                                    + "directory locator is corrupt.");
         }
-        skipBytes(ZIP64_EOCD_CFD_LOCATOR_OFFSET
+        skipBytes(ZIP64_EOCD_CFD_SIZE_OFFSET
                   - WORD /* signature has already been read */);
         archive.readFully(DWORD_BUF);
+        final long size = ZipEightByteInteger.getLongValue(DWORD_BUF);
+        archive.readFully(DWORD_BUF);
         archive.seek(ZipEightByteInteger.getLongValue(DWORD_BUF));
+        return size;
     }
 
     /**
@@ -825,12 +842,17 @@ public class ZipFile implements Closeable {
      *
      * Expects stream to be positioned at the beginning of the
      * &quot;End of central dir record&quot;.
+     *
+     * @return Size of the central directory in bytes
      */
-    private void positionAtCentralDirectory32()
+    private long positionAtCentralDirectory32()
         throws IOException {
-        skipBytes(CFD_LOCATOR_OFFSET);
+        skipBytes(CFD_SIZE_OFFSET);
+        archive.readFully(WORD_BUF);
+        long size = ZipLong.getValue(WORD_BUF);
         archive.readFully(WORD_BUF);
         archive.seek(ZipLong.getValue(WORD_BUF));
+        return size;
     }
 
     /**
