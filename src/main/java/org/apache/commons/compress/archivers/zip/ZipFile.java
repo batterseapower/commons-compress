@@ -76,6 +76,8 @@ import static org.apache.commons.compress.archivers.zip.ZipConstants.ZIP64_MAGIC
  *
  */
 public class ZipFile implements Closeable {
+    private static final boolean slow = false; // MCB
+
     private static final int HASH_SIZE = 509;
     static final int NIBLET_MASK = 0x0f;
     static final int BYTE_SHIFT = 8;
@@ -354,12 +356,11 @@ public class ZipFile implements Closeable {
      * @param ze The entry to get the stream for
      * @return The raw input stream containing (possibly) compressed data.
      */
-    private InputStream getRawInputStream(ZipArchiveEntry ze) {
+    private InputStream getRawInputStream(ZipArchiveEntry ze) throws IOException {
         if (!(ze instanceof Entry)) {
             return null;
         }
-        OffsetEntry offsetEntry = ((Entry) ze).getOffsetEntry();
-        long start = offsetEntry.dataOffset;
+        long start = resolveLocalFileHeaderData((Entry) ze);
         return new BoundedInputStream(start, ze.getCompressedSize());
     }
 
@@ -399,7 +400,7 @@ public class ZipFile implements Closeable {
         // cast valididty is checked just above
         OffsetEntry offsetEntry = ((Entry) ze).getOffsetEntry();
         ZipUtil.checkRequestedFeatures(ze);
-        long start = offsetEntry.dataOffset;
+        long start = resolveLocalFileHeaderData((Entry) ze);
         BoundedInputStream bis =
             new BoundedInputStream(start, ze.getCompressedSize());
         switch (ZipMethod.getMethodByCode(ze.getMethod())) {
@@ -929,29 +930,13 @@ public class ZipFile implements Closeable {
             // entries is filled in populateFromCentralDirectory and
             // never modified
             Entry ze = (Entry) zipArchiveEntry;
-            OffsetEntry offsetEntry = ze.getOffsetEntry();
-            long offset = offsetEntry.headerOffset;
-            archive.seek(offset + LFH_OFFSET_FOR_FILENAME_LENGTH);
-            archive.readFully(SHORT_BUF);
-            int fileNameLen = ZipShort.getValue(SHORT_BUF);
-            archive.readFully(SHORT_BUF);
-            int extraFieldLen = ZipShort.getValue(SHORT_BUF);
-            int lenToSkip = fileNameLen;
-            while (lenToSkip > 0) {
-                int skipped = archive.skipBytes(lenToSkip);
-                if (skipped <= 0) {
-                    throw new IOException("failed to skip file name in"
-                                          + " local file header");
-                }
-                lenToSkip -= skipped;
-            }
-            byte[] localExtraData = new byte[extraFieldLen];
-            archive.readFully(localExtraData);
-            ze.setExtra(localExtraData);
-            offsetEntry.dataOffset = offset + LFH_OFFSET_FOR_FILENAME_LENGTH
-                + SHORT + SHORT + fileNameLen + extraFieldLen;
 
-            if (entriesWithoutUTF8Flag.containsKey(ze)) {
+            final boolean needLocalName = entriesWithoutUTF8Flag.containsKey(ze);
+            if (needLocalName || slow) {
+                resolveLocalFileHeaderData(ze);
+            }
+
+            if (needLocalName) {
                 NameAndComment nc = entriesWithoutUTF8Flag.get(ze);
                 ZipUtil.setNameAndCommentFromExtraFields(ze, nc.name,
                                                          nc.comment);
@@ -965,6 +950,34 @@ public class ZipFile implements Closeable {
             }
             entriesOfThatName.addLast(ze);
         }
+    }
+
+    private long resolveLocalFileHeaderData(Entry ze) throws IOException {
+        OffsetEntry offsetEntry = ze.getOffsetEntry();
+        if (offsetEntry.dataOffset == -1) {
+            long offset = offsetEntry.headerOffset;
+            archive.seek(offset + LFH_OFFSET_FOR_FILENAME_LENGTH);
+            archive.readFully(SHORT_BUF);
+            int fileNameLen = ZipShort.getValue(SHORT_BUF);
+            archive.readFully(SHORT_BUF);
+            int extraFieldLen = ZipShort.getValue(SHORT_BUF);
+            int lenToSkip = fileNameLen;
+            while (lenToSkip > 0) {
+                int skipped = archive.skipBytes(lenToSkip);
+                if (skipped <= 0) {
+                    throw new IOException("failed to skip file name in"
+                            + " local file header");
+                }
+                lenToSkip -= skipped;
+            }
+            byte[] localExtraData = new byte[extraFieldLen];
+            archive.readFully(localExtraData);
+            ze.setExtra(localExtraData);
+            offsetEntry.dataOffset = offset + LFH_OFFSET_FOR_FILENAME_LENGTH
+                    + SHORT + SHORT + fileNameLen + extraFieldLen;
+        }
+
+        return offsetEntry.dataOffset;
     }
 
     /**
@@ -1110,10 +1123,7 @@ public class ZipFile implements Closeable {
             if (super.equals(other)) {
                 // super.equals would return false if other were not an Entry
                 Entry otherEntry = (Entry) other;
-                return offsetEntry.headerOffset
-                        == otherEntry.offsetEntry.headerOffset
-                    && offsetEntry.dataOffset
-                        == otherEntry.offsetEntry.dataOffset;
+                return offsetEntry == otherEntry.offsetEntry;
             }
             return false;
         }
