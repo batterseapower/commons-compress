@@ -491,9 +491,10 @@ public class ZipArchiveOutputStream extends ArchiveOutputStream {
         long realCrc = streamCompressor.getCrc32();
         entry.bytesRead = streamCompressor.getBytesRead();
         final Zip64Mode effectiveMode = getEffectiveZip64Mode(entry.entry);
+        final int method = entry.entry.getMethod();
         final boolean actuallyNeedsZip64 = handleSizesAndCrc(bytesWritten, realCrc, effectiveMode);
         closeEntry(actuallyNeedsZip64, false);
-        streamCompressor.reset();
+        streamCompressor.reset(method);
     }
 
     /**

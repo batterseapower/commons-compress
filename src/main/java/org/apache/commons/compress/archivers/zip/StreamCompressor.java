@@ -162,7 +162,7 @@ public abstract class StreamCompressor implements Closeable {
      */
 
     public void deflate(InputStream source, int method) throws IOException {
-        reset();
+        reset(method);
         int length;
 
         while ((length = source.read(readerBuf, 0, readerBuf.length)) >= 0) {
@@ -196,9 +196,11 @@ public abstract class StreamCompressor implements Closeable {
     }
 
 
-    void reset() {
+    void reset(int method) {
         crc.reset();
-        def.reset();
+        if (method == ZipArchiveEntry.DEFLATED) {
+            def.reset();
+        }
         sourcePayloadLength = 0;
         writtenToOutputStreamForLastEntry = 0;
     }
